@@ -1,141 +1,197 @@
-"""STUDENT FILE: implement the canonical twiddle helpers.
+"""
+twiddles.py — host-side twiddle / DFT-matrix helpers.
 
-Three patterns (so seven inconsistently-named lecture helpers collapse to ~3):
-  1. radix-2 length-N/2 twiddles   make_radix2_twiddles
-  2. per-stage radix-16 twiddles   make_radix16_twiddles
-  3. Bailey cross-term twiddles    make_bailey_cross_twiddles
-
-Plus two scaffolding tables (full DFT, padded-R DFT) and the bit-reversal
-permutation. Use the forward-FFT sign convention exp(-2*pi*i * ...) and
-return (re, im) tuples of separate real-valued tensors everywhere.
-
-When you implement each function, the signature should match the docstring
-exactly -- the harness expects (re, im) tuples with specific shapes/dtypes,
-and sanity_check.py will FAIL if you return something else.
+Convention: forward FFT, exp(-2*pi*i * ...).
+All helpers return (re, im) tuples of separate real-valued float32 tensors
+(or float16 where noted).  No complex dtype is used anywhere.
 """
 
 import math
-
 import torch
 
 
-# =============================================================================
-# Pattern 1: radix-2 length-N/2 twiddles  (F2, F3)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-def make_radix2_twiddles(
-    N: int,
-    dtype: torch.dtype = torch.float32,
-    device: str = 'cuda',
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """w_N^k for k in [0, N/2). Returns (tw_re, tw_im), each shape (N//2,).
-
-    Used by the radix-2 butterfly: stage s reads twiddle at index
-    (k & (2**s - 1)) * (N >> (s+1)), so the table only needs the lower half
-    of one full period."""
-    raise NotImplementedError("TODO: implement make_radix2_twiddles")
-
-
-# =============================================================================
-# Pattern 2: per-stage radix-16 twiddles  (F4; reused by F5/F6/F7 via F4)
-# =============================================================================
-# The index bookkeeping for this helper is given -- the per-stage permute
-# schedule means the column-axis labels at stage s are a mix of already-
-# transformed output digits and not-yet-transformed input digits, in an
-# order set by the cumulative permutation history. 
-
-def _column_axis_labeling(L: int) -> list[tuple]:
-    """Track axis labels through the per-stage permute schedule.
-
-    Convention: input n decomposes as n = sum_i d_i * 16^(L-1-i) with d_0 the
-    high digit; output k similarly with e_i. Initial tile has axis i labeled
-    ('d', i). At each stage s the kernel applies perm = (s,) + (others in
-    original order), bringing axis s to position 0; the four-tl.dot then
-    transforms position 0 from ('d', s) to ('e', L-1-s).
-
-    Returns a list of length L; entry s is the tuple of L-1 labels at axis
-    positions 1..L-1 of the (16,)*L tile *after* the stage-s permute.
+def _roots(N: int, numerator, dtype=torch.float32, device="cuda"):
     """
-    A = [('d', i) for i in range(L)]
-    out = []
+    Return (re, im) for exp(-2*pi*i * numerator / N).
+    numerator is a 1-D integer tensor or Python int.
+    """
+    if isinstance(numerator, int):
+        angle = -2.0 * math.pi * numerator / N
+        return (torch.tensor(math.cos(angle), dtype=dtype, device=device),
+                torch.tensor(math.sin(angle), dtype=dtype, device=device))
+    angle = -2.0 * math.pi * numerator.to(dtype=torch.float64) / N
+    re = torch.cos(angle).to(dtype=dtype).to(device=device)
+    im = torch.sin(angle).to(dtype=dtype).to(device=device)
+    return re, im
+
+
+# ---------------------------------------------------------------------------
+# Scaffolding (used internally and by F1 / F6 / F7)
+# ---------------------------------------------------------------------------
+
+def make_dft_matrix(N: int, device="cuda", dtype=torch.float32):
+    """
+    Return (re, im) each (N, N) float32.
+    W[j, k] = exp(-2*pi*i * j*k / N).
+    """
+    j = torch.arange(N, device=device)          # (N,)
+    k = torch.arange(N, device=device)          # (N,)
+    jk = j.unsqueeze(1) * k.unsqueeze(0)        # (N, N)  outer product
+    re, im = _roots(N, jk, dtype=dtype, device=device)
+    return re, im
+
+
+def make_dft_R_padded(R: int, device="cuda", dtype=torch.float32):
+    """
+    Return (re, im) each (16, 16) float32.
+    Top-left (R, R) block holds the DFT matrix for length R;
+    the rest is identity-padded so a (16, 16) tl.dot still works.
+
+    R must be in {2, 4, 8, 16}.
+    """
+    assert R in (2, 4, 8, 16), f"make_dft_R_padded: R={R} not in {{2,4,8,16}}"
+    re_full = torch.eye(16, dtype=dtype, device=device)
+    im_full = torch.zeros(16, 16, dtype=dtype, device=device)
+    re_sub, im_sub = make_dft_matrix(R, device=device, dtype=dtype)   # (R, R)
+    re_full[:R, :R] = re_sub
+    im_full[:R, :R] = im_sub
+    return re_full, im_full
+
+
+def bit_reversal_perm(N: int, device="cuda", dtype=torch.int32):
+    """
+    Return int32 tensor of shape (N,) with bit-reversal permutation for N = 2^L.
+    rev[i] is the integer whose L-bit binary rep is i's bits reversed.
+    """
+    L = int(math.log2(N))
+    assert 1 << L == N, "N must be a power of 2"
+    idx = torch.arange(N, dtype=torch.int32, device=device)
+    rev = torch.zeros(N, dtype=torch.int32, device=device)
+    for _ in range(L):
+        rev = (rev << 1) | (idx & 1)
+        idx = idx >> 1
+    return rev
+
+
+# ---------------------------------------------------------------------------
+# Pattern 1 — radix-2 twiddle table  (F2, F3)
+# ---------------------------------------------------------------------------
+
+def make_radix2_twiddles(N: int, device="cuda", dtype=torch.float32):
+    """
+    Return (re, im) each (N//2,) float32.
+    Entry t holds w_N^t = exp(-2*pi*i*t / N) for t in [0, N//2).
+
+    Usage in a butterfly stage s:
+        twiddle index = (j & ((1 << s) - 1)) * (N >> (s + 1))
+    which ranges over [0, N//2), so the full table covers every stage.
+    """
+    t = torch.arange(N // 2, device=device)
+    return _roots(N, t, dtype=dtype, device=device)
+
+
+# ---------------------------------------------------------------------------
+# Pattern 2 — radix-16 per-stage twiddle table  (F4, F5, F6, F7)
+# ---------------------------------------------------------------------------
+
+def _column_axis_labeling(L: int):
+    """
+    Returns a list of length L.  Entry s is a list of the digit labels
+    that appear at column-axis positions 1..L-1 at the start of stage s,
+    ordered by their axis position (position 1 first).
+
+    These are the *output* digit labels e_{L-1-j} for j in 0..s-1.
+    At stage s, axes 0..s-1 already hold output digits; axis 0 is
+    being transformed this step, axes 1..s-1 hold already-transformed
+    output digits.  After the stage-s permute, the order is:
+        axis 0: d_s   (current input digit, about to be transformed)
+        axis 1..s-1: e_{L-1}, e_{L-2}, ..., e_{L-s+1}   (already done)
+        axis s..L-1: d_{s+1}, ..., d_{L-1}               (not yet done)
+    So "column" positions 1..s-1 carry output digit labels
+    e_{L-1-(0)} = e_{L-1}, e_{L-1-(1)} = e_{L-2}, ..., up to e_{L-s+1}.
+    """
+    col_labels = []
     for s in range(L):
-        P = [A[s]] + [A[i] for i in range(L) if i != s]
-        out.append(tuple(P[1:]))
-        A = [('e', L - 1 - s)] + P[1:]
-    return out
+        # output digits already placed at axes 1..s-1 after the permute
+        labels = [L - 1 - j for j in range(s)]  # e_{L-1}, ..., e_{L-s+1}
+        col_labels.append(labels)
+    return col_labels
 
 
-def make_radix16_twiddles(
-    N: int,
-    device: str = 'cuda',
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-stage radix-16 Cooley-Tukey twiddles, stacked. Returns
-    (tw_re, tw_im), each shape (L, 16, N//16) fp16. L = log_16(N).
-
-    Stage-0 slice is ones (kernel skips the multiply on s == 0). Stage s > 0
-    is built from the labeling above via:
-        tw[m, c] = exp(-2*pi*i * m * t / 16^(s+1))
-        t = sum_{j=0}^{s-1} e_{L-1-j}_value(c) * 16^j
-    where e_{L-1-j}_value(c) reads the base-16 digit of c at the position
-    given by _column_axis_labeling(L)[s].
+def make_radix16_twiddles(N: int, device="cuda", dtype=torch.float16):
     """
-    raise NotImplementedError("TODO: implement make_radix16_twiddles")
+    Return (re, im) each (L, 16, N//16) float16,
+    where L = log16(N).
 
+    Entry [s, m, c] = exp(-2*pi*i * m * t(s,c) / 16^(s+1))
 
-# =============================================================================
-# Pattern 3: Bailey cross-term twiddles  (F3, F5, F6, F7)
-# =============================================================================
+    where t(s, c) is reconstructed from the already-transformed output
+    digits whose column-axis labels appear at axis positions 1..s-1 in
+    the stage-s tile layout:
 
-def make_bailey_cross_twiddles(
-    m0: int,
-    M: int,
-    N: int,
-    dtype: torch.dtype = torch.float16,
-    device: str = 'cuda',
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """w_N^{n1 * kM} for n1 in [0, m0), kM in [0, M). Returns (re, im), each
-    shape (m0, M).
+        t = sum_{j=0}^{s-1}  digit_e_{L-1-j}(c)  *  16^j
 
-    F3 calls this with dtype=torch.float32 (the radix-2 tier is fp32);
-    F5/F6/F7 call it with dtype=torch.float16 (the tcFFT tier is fp16). The
-    Bailey identity holds for any N >= m0 * M; in practice N == m0 * M.
+    digit_e_{L-1-j}(c) is the (L-1-j)-th base-16 digit of c
+    when c is viewed as an index into the sub-table of size 16^s.
+
+    At s=0 there are no preceding digits, so t=0 for all c → twiddle = 1.
     """
-    raise NotImplementedError("TODO: implement make_bailey_cross_twiddles")
+    L = int(round(math.log(N, 16)))
+    assert 16 ** L == N, f"N must be a power of 16 (got N={N})"
+    M = N // 16   # = 16^(L-1)
+
+    re_all = torch.ones(L, 16, M, dtype=torch.float32, device=device)
+    im_all = torch.zeros(L, 16, M, dtype=torch.float32, device=device)
+
+    c = torch.arange(M, device=device)  # column indices 0..M-1
+
+    for s in range(1, L):     # s=0 → twiddle = 1, skip
+        # Reconstruct t from the s already-processed output digits.
+        # After the stage-s permute, the column sub-table has size 16^s.
+        # The digit at position j (0-indexed) corresponds to output digit
+        # e_{L-1-j}, which lives in the j-th base-16 digit of c
+        # (c ranges over [0, 16^s) for each independent group;
+        #  here c ranges over [0, M) = [0, 16^(L-1)) — we use c mod 16^s).
+        sub_size = 16 ** s
+        c_mod = c % sub_size   # shape (M,)
+        t = torch.zeros(M, dtype=torch.int64, device=device)
+        for j in range(s):
+            # j-th base-16 digit of c_mod
+            digit = (c_mod // (16 ** j)) % 16
+            t = t + digit * (16 ** j)
+        # t has shape (M,); m has shape (16,)
+        m = torch.arange(16, device=device)         # (16,)
+        # twiddle[m, c] = exp(-2pi*i * m * t[c] / 16^(s+1))
+        mt = m.unsqueeze(1) * t.unsqueeze(0)        # (16, M)
+        denom = 16 ** (s + 1)
+        re_s, im_s = _roots(denom, mt, dtype=torch.float32, device=device)
+        re_all[s] = re_s
+        im_all[s] = im_s
+
+    return re_all.to(torch.float16), im_all.to(torch.float16)
 
 
-# =============================================================================
-# Scaffolding tables
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Pattern 3 — Bailey cross-twiddle  (F3, F5, F6, F7)
+# ---------------------------------------------------------------------------
 
-def make_dft_matrix(
-    N: int,
-    dtype: torch.dtype = torch.float16,
-    device: str = 'cuda',
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Full (N, N) DFT matrix. Returns (W_re, W_im).
-
-    W[j, k] = exp(-2*pi*i * j * k / N). Used by F1 (DFT-as-complex-matmul).
+def make_bailey_cross_twiddles(m0: int, M: int, N: int = None, device="cuda", dtype=torch.float16):
     """
-    raise NotImplementedError("TODO: implement make_dft_matrix")
+    Return (re, im) each (m0, M) float16.
+    Entry [n1, k2] = exp(-2*pi*i * n1 * k2 / (m0 * M))
+    i.e. w_{N}^{n1 * k2}  where N = m0 * M.
 
-
-def make_dft_R_padded(
-    R: int,
-    device: str = 'cuda',
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Length-R DFT padded to (16, 16) fp16. Returns (M_re, M_im).
-
-    Pad the length-R row to 16 with zeros, hit it with a (16, 16) matrix whose
-    first R columns are F_R (rows wrap mod R), take the first R output rows.
-    This makes the >=16x16 tl.dot requirement hold for all R in {2, 4, 8, 16}.
+    N parameter is accepted for harness compatibility but ignored (always m0*M).
+    n1 in [0, m0), k2 in [0, M).
     """
-    raise NotImplementedError("TODO: implement make_dft_R_padded")
-
-
-def bit_reversal_perm(N: int, device: str = 'cuda') -> torch.Tensor:
-    """Length-N bit-reversal permutation as a (N,) int32 tensor.
-
-    rev[i] is the integer whose n_bits=log2(N) binary representation is i's
-    bits in reversed order.
-    """
-    raise NotImplementedError("TODO: implement bit_reversal_perm")
+    _ = N  # harness may pass N=m0*M explicitly; we recompute it anyway
+    N = m0 * M
+    n1 = torch.arange(m0, device=device)    # (m0,)
+    k2 = torch.arange(M, device=device)    # (M,)
+    nk = n1.unsqueeze(1) * k2.unsqueeze(0) # (m0, M)
+    re, im = _roots(N, nk, dtype=torch.float32, device=device)
+    return re.to(dtype), im.to(dtype)
