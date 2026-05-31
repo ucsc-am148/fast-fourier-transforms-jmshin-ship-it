@@ -279,7 +279,7 @@ def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
         BLOCK_N=N, LOG2N=LOG2N,
         BAILEY_EPILOGUE=BAILEY_EPILOGUE,
         STRIDED_STORE=STRIDED_STORE,
-        num_warps=min(N//32, 32), num_stages=1,
+        num_warps=1, num_stages=1,
     )
 
 
