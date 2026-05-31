@@ -1,15 +1,5 @@
 """
 kernels.py — Triton kernels + pipeline drivers for F1..F7.
-
-Harness calling conventions (from harness.py):
-- f1_launch(x_re, x_im, W_re, W_im, y_re, y_im)
-- f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm)
-- f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B)
-- f4_kernel_L2[(grid,)](x_re, x_im, y_re, y_im, F_re, F_im, tw_re, tw_im,
-                        B, 1, BLOCK_B=, STAGE_STOP=, STORE_T=, ...)
-- f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B)
-- _f6_rec(in_re, in_im, B, chunks, plan, cyc) -> (out_re, out_im)
-- _f7_rec(in_re, in_im, B, chunks, plan, cyc) -> (out_re, out_im)
 """
 
 import math
@@ -29,7 +19,6 @@ from twiddles import (
 
 # ===========================================================================
 # F1 — Dense DFT as complex matmul
-# Uses small fixed tiles to avoid shared memory overflow.
 # ===========================================================================
 
 @triton.jit
@@ -42,24 +31,20 @@ def f1_kernel(
     stride_wb, stride_wn,
     stride_yb, stride_yn,
     BLOCK_B: tl.constexpr,
-    BLOCK_K: tl.constexpr,  # output k-tile size
-    BLOCK_N: tl.constexpr,  # inner n-loop tile size
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_k = tl.program_id(1)
-
     b_offs = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
     k_offs = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
     b_mask = b_offs < B
     k_mask = k_offs < N
-
     acc_re = tl.zeros((BLOCK_B, BLOCK_K), dtype=tl.float32)
     acc_im = tl.zeros((BLOCK_B, BLOCK_K), dtype=tl.float32)
-
     for n_start in range(0, N, BLOCK_N):
         n_offs = n_start + tl.arange(0, BLOCK_N)
         n_mask = n_offs < N
-
         x_re = tl.load(x_re_ptr + b_offs[:, None] * stride_xb + n_offs[None, :] * stride_xn,
                        mask=b_mask[:, None] & n_mask[None, :], other=0.0).to(tl.float32)
         x_im = tl.load(x_im_ptr + b_offs[:, None] * stride_xb + n_offs[None, :] * stride_xn,
@@ -68,10 +53,8 @@ def f1_kernel(
                        mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
         w_im = tl.load(w_im_ptr + n_offs[:, None] * stride_wb + k_offs[None, :] * stride_wn,
                        mask=n_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
-
         acc_re += tl.dot(x_re, w_re) - tl.dot(x_im, w_im)
         acc_im += tl.dot(x_re, w_im) + tl.dot(x_im, w_re)
-
     tl.store(y_re_ptr + b_offs[:, None] * stride_yb + k_offs[None, :] * stride_yn,
              acc_re, mask=b_mask[:, None] & k_mask[None, :])
     tl.store(y_im_ptr + b_offs[:, None] * stride_yb + k_offs[None, :] * stride_yn,
@@ -95,58 +78,77 @@ def f1_launch(x_re, x_im, w_re, w_im, y_re, y_im):
 
 
 # ===========================================================================
-# F2 — Radix-2 Cooley-Tukey in Triton registers
-# One program per signal; all log2(N) butterfly stages in registers.
-# Uses y buffer as scratchpad for partner reads between stages.
+# F2 — Stockham FFT (no scratchpad, no bit-reversal, race-free)
+# Reads from buffer A, writes to buffer B, ping-pongs each stage.
 # ===========================================================================
 
 @triton.jit
-def f2_kernel(
-    x_re_ptr, x_im_ptr,
-    tw_re_ptr, tw_im_ptr,
-    brp_ptr,
-    y_re_ptr, y_im_ptr,
-    ct_re_ptr, ct_im_ptr,
-    B, N,
-    stride_xb, stride_yb, N2, row_offset,
+def stockham_stage_kernel(
+    a_re_ptr, a_im_ptr,
+    b_re_ptr, b_im_ptr,
+    N, m,          # m = 2^s = half butterfly size at this stage
     BLOCK_N: tl.constexpr,
-    LOG2N: tl.constexpr,
+):
+    """
+    One Stockham stage. Each program handles one batch element.
+    Input in A (stride N per batch), output to B (stride N per batch).
+    For each output position n:
+      i0 = (n % m) + (n // (2*m)) * m        upper source
+      i1 = i0 + N//2                           lower source
+      tw = exp(-2pi*i * (n%m) / (2*m*2)) -- wait:
+      tw = exp(-2pi*i * (n%m) / (2^(s+1))) where 2^s = m
+         = exp(-2pi*i * (n%m) / (2*m))
+    """
+    pid = tl.program_id(0)
+    n = tl.arange(0, BLOCK_N)
+
+    # Source indices in A
+    k = n % m                    # position within butterfly (0..m-1)
+    j = n // (2 * m)             # which group
+    i0 = j * m + k              # upper source
+    i1 = i0 + N // 2            # lower source
+
+    u_re = tl.load(a_re_ptr + pid * N + i0, mask=n < N, other=0.0)
+    u_im = tl.load(a_im_ptr + pid * N + i0, mask=n < N, other=0.0)
+    l_re = tl.load(a_re_ptr + pid * N + i1, mask=n < N, other=0.0)
+    l_im = tl.load(a_im_ptr + pid * N + i1, mask=n < N, other=0.0)
+
+    # Twiddle: exp(-2pi*i * k / (2*m))
+    angle = -2.0 * 3.141592653589793 * k.to(tl.float32) / (2.0 * m)
+    tw_re = tl.cos(angle)
+    tw_im = tl.sin(angle)
+
+    tv_re = tw_re * l_re - tw_im * l_im
+    tv_im = tw_re * l_im + tw_im * l_re
+
+    # Output index (natural order): upper at n if n%2m < m, lower otherwise
+    # Upper goes to: j*(2m) + k, lower goes to j*(2m) + k + m
+    is_upper = (n % (2 * m)) < m
+    out_re = tl.where(is_upper, u_re + tv_re, u_re - tv_re)
+    out_im = tl.where(is_upper, u_im + tv_im, u_im - tv_im)
+
+    tl.store(b_re_ptr + pid * N + n, out_re, mask=n < N)
+    tl.store(b_im_ptr + pid * N + n, out_im, mask=n < N)
+
+
+@triton.jit
+def stockham_epilogue_kernel(
+    # final buffer (result after L stages)
+    a_re_ptr, a_im_ptr,
+    # output
+    y_re_ptr, y_im_ptr,
+    # optional Bailey cross-twiddle
+    ct_re_ptr, ct_im_ptr,
+    N, N2,
+    stride_yb,
+    BLOCK_N: tl.constexpr,
     BAILEY_EPILOGUE: tl.constexpr,
     STRIDED_STORE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     n = tl.arange(0, BLOCK_N)
-
-    # Bit-reversed load
-    brp = tl.load(brp_ptr + n).to(tl.int32)
-    v_re = tl.load(x_re_ptr + (pid + row_offset) * stride_xb + brp, mask=n < N)
-    v_im = tl.load(x_im_ptr + (pid + row_offset) * stride_xb + brp, mask=n < N)
-
-    # Butterfly stages
-    for s in range(LOG2N):
-        half = 1 << s
-        partner = n ^ half
-        tw_idx = (n & (half - 1)) * (N >> (s + 1))
-        tw_re = tl.load(tw_re_ptr + tw_idx)
-        tw_im = tl.load(tw_im_ptr + tw_idx)
-
-        # Write current to scratch, read partner back
-        tl.store(y_re_ptr + pid * stride_yb + n, v_re, mask=n < N)
-        tl.store(y_im_ptr + pid * stride_yb + n, v_im, mask=n < N)
-        p_re = tl.load(y_re_ptr + pid * stride_yb + partner, mask=partner < N)
-        p_im = tl.load(y_im_ptr + pid * stride_yb + partner, mask=partner < N)
-
-        is_upper = ((n >> s) & 1) == 0
-        # tw * v[n] (for lower element formula)
-        tv_self_re = tw_re * v_re - tw_im * v_im
-        tv_self_im = tw_re * v_im + tw_im * v_re
-        # tw * v[partner] (for upper element formula)
-        tv_part_re = tw_re * p_re - tw_im * p_im
-        tv_part_im = tw_re * p_im + tw_im * p_re
-        # upper: new = v[n] + tw * v[partner]
-        # lower: new = v[partner] - tw * v[n]
-        v_re = tl.where(is_upper, v_re + tv_part_re, p_re - tv_self_re)
-        v_im = tl.where(is_upper, v_im + tv_part_im, p_im - tv_self_im)
+    v_re = tl.load(a_re_ptr + pid * N + n, mask=n < N)
+    v_im = tl.load(a_im_ptr + pid * N + n, mask=n < N)
 
     if BAILEY_EPILOGUE:
         ct_re = tl.load(ct_re_ptr + pid * N2 + n, mask=n < N, other=1.0)
@@ -165,56 +167,78 @@ def f2_kernel(
         tl.store(y_im_ptr + pid * stride_yb + n, v_im, mask=n < N)
 
 
+@triton.jit
+def f2_kernel(
+    x_re_ptr, x_im_ptr,
+    tw_re_ptr, tw_im_ptr,
+    brp_ptr,
+    y_re_ptr, y_im_ptr,
+    ct_re_ptr, ct_im_ptr,
+    B, N,
+    stride_xb, stride_yb, N2, row_offset,
+    BLOCK_N: tl.constexpr,
+    LOG2N: tl.constexpr,
+    BAILEY_EPILOGUE: tl.constexpr,
+    STRIDED_STORE: tl.constexpr,
+):
+    """Stub for harness compatibility."""
+    pid = tl.program_id(0)
+    n = tl.arange(0, BLOCK_N)
+    re = tl.load(x_re_ptr + (pid + row_offset) * stride_xb + n, mask=n < N)
+    im = tl.load(x_im_ptr + (pid + row_offset) * stride_xb + n, mask=n < N)
+    tl.store(y_re_ptr + pid * stride_yb + n, re, mask=n < N)
+    tl.store(y_im_ptr + pid * stride_yb + n, im, mask=n < N)
 
-def _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
-                     ct_re=None, ct_im=None, N2=1,
-                     BAILEY_EPILOGUE=False, STRIDED_STORE=False):
-    import torch, math
-    B, N = x_re.shape
-    LOG2N = int(math.log2(N))
-    idx = brp.long()
-    v_re = x_re[:, idx].clone()
-    v_im = x_im[:, idx].clone()
-    for s in range(LOG2N):
-        half = 1 << s
-        full = half << 1
-        num_groups = N // full
-        tw_idx = torch.arange(half, device=x_re.device) * (N >> (s + 1))
-        tw_r = tw_re[tw_idx]
-        tw_i = tw_im[tw_idx]
-        g = torch.arange(num_groups, device=x_re.device)
-        j = torch.arange(half, device=x_re.device)
-        upper = (g[:, None] * full + j[None, :]).reshape(-1)
-        lower = upper + half
-        tw_r_b = tw_r.unsqueeze(0).expand(num_groups, -1).reshape(-1)
-        tw_i_b = tw_i.unsqueeze(0).expand(num_groups, -1).reshape(-1)
-        u_re = v_re[:, upper]; u_im = v_im[:, upper]
-        w_re = v_re[:, lower]; w_im = v_im[:, lower]
-        tw_w_re = tw_r_b * w_re - tw_i_b * w_im
-        tw_w_im = tw_r_b * w_im + tw_i_b * w_re
-        v_re[:, upper] = u_re + tw_w_re; v_im[:, upper] = u_im + tw_w_im
-        v_re[:, lower] = u_re - tw_w_re; v_im[:, lower] = u_im - tw_w_im
-    if BAILEY_EPILOGUE:
-        v_re, v_im = v_re * ct_re - v_im * ct_im, v_re * ct_im + v_im * ct_re
-    if STRIDED_STORE:
-        N2 = int(N2)
-        import torch as _t
-        n = _t.arange(N, device=x_re.device)
-        out = (n % N2) * (N // N2) + (n // N2)
-        r, i = _t.empty_like(v_re), _t.empty_like(v_im)
-        r[:, out] = v_re; i[:, out] = v_im
-        return r, i
-    return v_re, v_im
 
 def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
                ct_re=None, ct_im=None, N2=1, row_offset=0,
                BAILEY_EPILOGUE=False, STRIDED_STORE=False):
-    out_re, out_im = _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
-                                      ct_re=ct_re, ct_im=ct_im, N2=int(N2),
-                                      BAILEY_EPILOGUE=BAILEY_EPILOGUE,
-                                      STRIDED_STORE=STRIDED_STORE)
-    y_re.copy_(out_re)
-    y_im.copy_(out_im)
+    """Stockham FFT: race-free, no scratchpad, no bit-reversal needed."""
+    B, N = x_re.shape
+    LOG2N = int(math.log2(N))
+    assert 1 << LOG2N == N
+
+    # Allocate two ping-pong buffers (flat B*N)
+    buf_re = [
+        x_re.reshape(-1).contiguous().clone(),
+        torch.empty(B * N, dtype=x_re.dtype, device=x_re.device),
+    ]
+    buf_im = [
+        x_im.reshape(-1).contiguous().clone(),
+        torch.empty(B * N, dtype=x_im.dtype, device=x_im.device),
+    ]
+
+    cur = 0  # which buffer is current input
+    m = 1
+    for s in range(LOG2N):
+        nxt = 1 - cur
+        stockham_stage_kernel[(B,)](
+            buf_re[cur], buf_im[cur],
+            buf_re[nxt], buf_im[nxt],
+            N, m, BLOCK_N=N,
+        )
+        cur = nxt
+        m *= 2
+
+    # Epilogue: copy result to y, apply Bailey cross-twiddle if needed
+    if ct_re is None:
+        ct_re_arg = x_re
+        ct_im_arg = x_im
+    else:
+        ct_re_arg = ct_re
+        ct_im_arg = ct_im
+
+    stockham_epilogue_kernel[(B,)](
+        buf_re[cur].reshape(B, N),
+        buf_im[cur].reshape(B, N),
+        y_re, y_im,
+        ct_re_arg, ct_im_arg,
+        N, int(N2),
+        y_re.stride(0),
+        BLOCK_N=N, LOG2N=LOG2N,
+        BAILEY_EPILOGUE=BAILEY_EPILOGUE,
+        STRIDED_STORE=STRIDED_STORE,
+    )
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
@@ -262,8 +286,7 @@ def _transpose(x_re, x_im, B, R, C):
 
 
 # ===========================================================================
-# F3 — Bailey six-step (T1 → F2-A+epilogue → T2 → F2-B)
-# f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B)
+# F3 — Bailey six-step
 # ===========================================================================
 
 def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
@@ -280,10 +303,8 @@ def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
     bt_im    = plan['bt_im'].float()
     B = int(B)
 
-    # T1: (B, N2, N1) → (B, N1, N2)
     t1_re, t1_im = _transpose(in_re, in_im, B, N2, N1)
 
-    # F2-A with Bailey epilogue: (B*N1, N2)
     a_re = t1_re.reshape(B * N1, N2).contiguous()
     a_im = t1_im.reshape(B * N1, N2).contiguous()
     fa_re = mid_re[:B * N1 * N2].reshape(B * N1, N2)
@@ -293,17 +314,14 @@ def f3_launch(in_re, in_im, out_re, out_im, mid_re, mid_im, plan, B):
     _f2_triton(a_re, a_im, tw_re_n2, tw_im_n2, perm_n2, fa_re, fa_im,
                ct_re=ct_re, ct_im=ct_im, N2=N2, BAILEY_EPILOGUE=True)
 
-    # T2: (B, N1, N2) → (B, N2, N1)
     t2_re, t2_im = _transpose(fa_re.reshape(B, N), fa_im.reshape(B, N), B, N1, N2)
 
-    # F2-B: (B*N2, N1)
     b_re = t2_re.reshape(B * N2, N1).contiguous()
     b_im = t2_im.reshape(B * N2, N1).contiguous()
     fb_re = mid_re[:B * N2 * N1].reshape(B * N2, N1)
     fb_im = mid_im[:B * N2 * N1].reshape(B * N2, N1)
     _f2_triton(b_re, b_im, tw_re_n1, tw_im_n1, perm_n1, fb_re, fb_im)
 
-    # (B, N2, N1) → (B, N1, N2) → flat
     result_re = fb_re.reshape(B, N2, N1).permute(0, 2, 1).contiguous().reshape(-1)
     result_im = fb_im.reshape(B, N2, N1).permute(0, 2, 1).contiguous().reshape(-1)
     out_re.copy_(result_re)
@@ -343,21 +361,18 @@ def f4_kernel_L2(
     a_im = tl.dot(dft_re, tile_im) + tl.dot(dft_im, tile_re)
 
     if STAGE_STOP == 1:
-        # Store A[k1,n1] row-major
         tl.store(y_re_ptr + b * 256 + offs_256, tl.reshape(a_re.to(tl.float16), (256,)))
         tl.store(y_im_ptr + b * 256 + offs_256, tl.reshape(a_im.to(tl.float16), (256,)))
     else:
-        # Twiddle: tw[k1,n1] = tw_table[n1,k1] (load transposed)
         tw_re = tl.load(tw_re_ptr + 256 + c_idx[:, None] * 16 + r_idx[None, :]).to(tl.float32)
         tw_im = tl.load(tw_im_ptr + 256 + c_idx[:, None] * 16 + r_idx[None, :]).to(tl.float32)
         b_re = a_re * tw_re - a_im * tw_im
         b_im = a_re * tw_im + a_im * tw_re
 
-        # Stage 1: C = B @ F -> [k1, k2]
         c_re = tl.dot(b_re, dft_re) - tl.dot(b_im, dft_im)
         c_im = tl.dot(b_re, dft_im) + tl.dot(b_im, dft_re)
 
-        out_idx = c_idx[None, :] * 16 + r_idx[:, None]  # k2*16+k1
+        out_idx = c_idx[None, :] * 16 + r_idx[:, None]
         out_re = c_re.to(tl.float16)
         out_im = c_im.to(tl.float16)
 
@@ -497,7 +512,7 @@ def _run_dft(x_re, x_im, R, dft_re, dft_im, store_t=False):
 
 
 # ===========================================================================
-# F5 — Bailey at N=65536 with F4 inner
+# F5
 # ===========================================================================
 
 def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
@@ -510,7 +525,6 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
     B = int(B)
 
     t1_re, t1_im = _transpose(in_re, in_im, B, N2, N1)
-
     a_re = t1_re.reshape(B * N1, N2).contiguous()
     a_im = t1_im.reshape(B * N1, N2).contiguous()
     fa_re = b1_re[:B * N1 * N2].reshape(B * N1, N2)
@@ -520,7 +534,6 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
     sc_re, sc_im = _scale(fa_re, fa_im, bt_re, bt_im, N1, N2)
 
     t2_re, t2_im = _transpose(sc_re.reshape(B, N), sc_im.reshape(B, N), B, N1, N2)
-
     b_re = t2_re.reshape(B * N2, N1).contiguous()
     b_im = t2_im.reshape(B * N2, N1).contiguous()
     fb_re = b2_re[:B * N2 * N1].reshape(B * N2, N1)
@@ -528,7 +541,6 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
     _run_f4(b_re, b_im, fb_re, fb_im, f4)
 
     t3_re, t3_im = _transpose(fb_re.reshape(B, N), fb_im.reshape(B, N), B, N2, N1)
-
     b0_re.copy_(t3_re.reshape(B, N))
     b0_im.copy_(t3_im.reshape(B, N))
 
@@ -556,7 +568,7 @@ def f6_factor(N):
 
 
 # ===========================================================================
-# F6/F7 helpers
+# F6/F7
 # ===========================================================================
 
 def _leaf_fft(x_re, x_im, chunk, plan):
@@ -591,7 +603,6 @@ def _f6_rec(in_re, in_im, B, chunks, plan, cyc):
     _, _, _, tw_re, tw_im = plan['tw'][tw_level]
 
     t1_re, t1_im = _transpose(in_re, in_im, B, M, m0)
-
     rec_re, rec_im = _f6_rec(
         t1_re.reshape(B * m0, M), t1_im.reshape(B * m0, M),
         B * m0, rest, plan, cyc)
@@ -636,7 +647,6 @@ def _f7_rec(in_re, in_im, B, chunks, plan, cyc):
     _, _, _, tw_re, tw_im = plan['tw'][tw_level]
 
     t1_re, t1_im = _transpose(in_re, in_im, B, M, m0)
-
     rec_re, rec_im = _f7_rec(
         t1_re.reshape(B * m0, M), t1_im.reshape(B * m0, M),
         B * m0, rest, plan, cyc)
@@ -646,7 +656,6 @@ def _f7_rec(in_re, in_im, B, chunks, plan, cyc):
         rec_re.reshape(B * m0, M), rec_im.reshape(B * m0, M),
         tw_re, tw_im, m0, M, store_t=True)
 
-    # FFT then T3 (separate, for bitwise equality with F6)
     f_re, f_im = _leaf_fft(
         t2_re.reshape(B * M, m0), t2_im.reshape(B * M, m0), m0, plan)
 
