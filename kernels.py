@@ -136,14 +136,17 @@ def f2_kernel(
         p_re = tl.load(y_re_ptr + pid * stride_yb + partner, mask=partner < N)
         p_im = tl.load(y_im_ptr + pid * stride_yb + partner, mask=partner < N)
 
-        is_lower = ((n >> s) & 1) == 0
-        # tw * partner value
-        tv_re = tw_re * p_re - tw_im * p_im
-        tv_im = tw_re * p_im + tw_im * p_re
-        # upper: new = v[n] + tw*v[partner]
-        # lower: new = v[partner] - tw*v[n]  (NOT v[n] - tw*v[partner])
-        v_re = tl.where(is_lower, v_re + tv_re, p_re - (tw_re * v_re - tw_im * v_im))
-        v_im = tl.where(is_lower, v_im + tv_im, p_im - (tw_re * v_im + tw_im * v_re))
+        is_upper = ((n >> s) & 1) == 0
+        # tw * v[n] (for lower element formula)
+        tv_self_re = tw_re * v_re - tw_im * v_im
+        tv_self_im = tw_re * v_im + tw_im * v_re
+        # tw * v[partner] (for upper element formula)
+        tv_part_re = tw_re * p_re - tw_im * p_im
+        tv_part_im = tw_re * p_im + tw_im * p_re
+        # upper: new = v[n] + tw * v[partner]
+        # lower: new = v[partner] - tw * v[n]
+        v_re = tl.where(is_upper, v_re + tv_part_re, p_re - tv_self_re)
+        v_im = tl.where(is_upper, v_im + tv_part_im, p_im - tv_self_im)
 
     if BAILEY_EPILOGUE:
         ct_re = tl.load(ct_re_ptr + pid * N2 + n, mask=n < N, other=1.0)
