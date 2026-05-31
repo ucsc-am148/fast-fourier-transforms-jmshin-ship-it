@@ -137,10 +137,13 @@ def f2_kernel(
         p_im = tl.load(y_im_ptr + pid * stride_yb + partner, mask=partner < N)
 
         is_lower = ((n >> s) & 1) == 0
+        # tw * partner value
         tv_re = tw_re * p_re - tw_im * p_im
         tv_im = tw_re * p_im + tw_im * p_re
-        v_re = tl.where(is_lower, v_re + tv_re, v_re - tv_re)
-        v_im = tl.where(is_lower, v_im + tv_im, v_im - tv_im)
+        # upper: new = v[n] + tw*v[partner]
+        # lower: new = v[partner] - tw*v[n]  (NOT v[n] - tw*v[partner])
+        v_re = tl.where(is_lower, v_re + tv_re, p_re - (tw_re * v_re - tw_im * v_im))
+        v_im = tl.where(is_lower, v_im + tv_im, p_im - (tw_re * v_im + tw_im * v_re))
 
     if BAILEY_EPILOGUE:
         ct_re = tl.load(ct_re_ptr + pid * N2 + n, mask=n < N, other=1.0)
@@ -203,12 +206,19 @@ def _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
 def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
                ct_re=None, ct_im=None, N2=1, row_offset=0,
                BAILEY_EPILOGUE=False, STRIDED_STORE=False):
-    out_re, out_im = _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
-                                      ct_re=ct_re, ct_im=ct_im, N2=int(N2),
-                                      BAILEY_EPILOGUE=BAILEY_EPILOGUE,
-                                      STRIDED_STORE=STRIDED_STORE)
-    y_re.copy_(out_re)
-    y_im.copy_(out_im)
+    B, N = x_re.shape
+    LOG2N = int(math.log2(N))
+    assert 1 << LOG2N == N
+    if ct_re is None:
+        ct_re = x_re
+        ct_im = x_im
+    f2_kernel[(B,)](
+        x_re, x_im, tw_re, tw_im, brp, y_re, y_im, ct_re, ct_im,
+        B, N, x_re.stride(0), y_re.stride(0), int(N2), row_offset,
+        BLOCK_N=N, LOG2N=LOG2N,
+        BAILEY_EPILOGUE=BAILEY_EPILOGUE,
+        STRIDED_STORE=STRIDED_STORE,
+    )
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
