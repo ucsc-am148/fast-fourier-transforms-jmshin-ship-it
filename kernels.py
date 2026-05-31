@@ -159,22 +159,56 @@ def f2_kernel(
         tl.store(y_im_ptr + pid * stride_yb + n, v_im, mask=n < N)
 
 
+
+def _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
+                     ct_re=None, ct_im=None, N2=1,
+                     BAILEY_EPILOGUE=False, STRIDED_STORE=False):
+    import torch, math
+    B, N = x_re.shape
+    LOG2N = int(math.log2(N))
+    idx = brp.long()
+    v_re = x_re[:, idx].clone()
+    v_im = x_im[:, idx].clone()
+    for s in range(LOG2N):
+        half = 1 << s
+        full = half << 1
+        num_groups = N // full
+        tw_idx = torch.arange(half, device=x_re.device) * (N >> (s + 1))
+        tw_r = tw_re[tw_idx]
+        tw_i = tw_im[tw_idx]
+        g = torch.arange(num_groups, device=x_re.device)
+        j = torch.arange(half, device=x_re.device)
+        upper = (g[:, None] * full + j[None, :]).reshape(-1)
+        lower = upper + half
+        tw_r_b = tw_r.unsqueeze(0).expand(num_groups, -1).reshape(-1)
+        tw_i_b = tw_i.unsqueeze(0).expand(num_groups, -1).reshape(-1)
+        u_re = v_re[:, upper]; u_im = v_im[:, upper]
+        w_re = v_re[:, lower]; w_im = v_im[:, lower]
+        tw_w_re = tw_r_b * w_re - tw_i_b * w_im
+        tw_w_im = tw_r_b * w_im + tw_i_b * w_re
+        v_re[:, upper] = u_re + tw_w_re; v_im[:, upper] = u_im + tw_w_im
+        v_re[:, lower] = u_re - tw_w_re; v_im[:, lower] = u_im - tw_w_im
+    if BAILEY_EPILOGUE:
+        v_re, v_im = v_re * ct_re - v_im * ct_im, v_re * ct_im + v_im * ct_re
+    if STRIDED_STORE:
+        N2 = int(N2)
+        import torch as _t
+        n = _t.arange(N, device=x_re.device)
+        out = (n % N2) * (N // N2) + (n // N2)
+        r, i = _t.empty_like(v_re), _t.empty_like(v_im)
+        r[:, out] = v_re; i[:, out] = v_im
+        return r, i
+    return v_re, v_im
+
 def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
                ct_re=None, ct_im=None, N2=1, row_offset=0,
                BAILEY_EPILOGUE=False, STRIDED_STORE=False):
-    B, N = x_re.shape
-    LOG2N = int(math.log2(N))
-    assert 1 << LOG2N == N
-    if ct_re is None:
-        ct_re = x_re
-        ct_im = x_im
-    f2_kernel[(B,)](
-        x_re, x_im, tw_re, tw_im, brp, y_re, y_im, ct_re, ct_im,
-        B, N, x_re.stride(0), y_re.stride(0), N2, row_offset,
-        BLOCK_N=N, LOG2N=LOG2N,
-        BAILEY_EPILOGUE=BAILEY_EPILOGUE,
-        STRIDED_STORE=STRIDED_STORE,
-    )
+    out_re, out_im = _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
+                                      ct_re=ct_re, ct_im=ct_im, N2=int(N2),
+                                      BAILEY_EPILOGUE=BAILEY_EPILOGUE,
+                                      STRIDED_STORE=STRIDED_STORE)
+    y_re.copy_(out_re)
+    y_im.copy_(out_im)
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
