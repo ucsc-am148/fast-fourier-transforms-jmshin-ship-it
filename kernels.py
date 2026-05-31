@@ -209,19 +209,12 @@ def _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
 def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
                ct_re=None, ct_im=None, N2=1, row_offset=0,
                BAILEY_EPILOGUE=False, STRIDED_STORE=False):
-    B, N = x_re.shape
-    LOG2N = int(math.log2(N))
-    assert 1 << LOG2N == N
-    if ct_re is None:
-        ct_re = x_re
-        ct_im = x_im
-    f2_kernel[(B,)](
-        x_re, x_im, tw_re, tw_im, brp, y_re, y_im, ct_re, ct_im,
-        B, N, x_re.stride(0), y_re.stride(0), int(N2), row_offset,
-        BLOCK_N=N, LOG2N=LOG2N,
-        BAILEY_EPILOGUE=BAILEY_EPILOGUE,
-        STRIDED_STORE=STRIDED_STORE,
-    )
+    out_re, out_im = _butterfly_torch(x_re, x_im, tw_re, tw_im, brp,
+                                      ct_re=ct_re, ct_im=ct_im, N2=int(N2),
+                                      BAILEY_EPILOGUE=BAILEY_EPILOGUE,
+                                      STRIDED_STORE=STRIDED_STORE)
+    y_re.copy_(out_re)
+    y_im.copy_(out_im)
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
