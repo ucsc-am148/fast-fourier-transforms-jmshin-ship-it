@@ -235,7 +235,7 @@ def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
         ct_re_arg, ct_im_arg,
         N, int(N2),
         y_re.stride(0),
-        BLOCK_N=N, LOG2N=LOG2N,
+        BLOCK_N=N,
         BAILEY_EPILOGUE=BAILEY_EPILOGUE,
         STRIDED_STORE=STRIDED_STORE,
     )
