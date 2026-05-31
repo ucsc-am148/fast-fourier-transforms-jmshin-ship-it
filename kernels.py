@@ -216,7 +216,6 @@ def dit_fft_kernel(
     # Write initial values to scratchpad
     tl.store(y_re_ptr + pid * stride_yb + n, v_re, mask=n < N)
     tl.store(y_im_ptr + pid * stride_yb + n, v_im, mask=n < N)
-
     for s in range(LOG2N):
         half = 1 << s
         partner = n ^ half
@@ -273,29 +272,15 @@ def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
     if ct_re is None:
         ct_re = x_re
         ct_im = x_im
-    scratch_re = torch.empty_like(y_re)
-    scratch_im = torch.empty_like(y_im)
     dit_fft_kernel[(B,)](
-        x_re, x_im, tw_re, tw_im, brp, scratch_re, scratch_im, ct_re, ct_im,
-        B, N, x_re.stride(0), scratch_re.stride(0), int(N2), row_offset,
+        x_re, x_im, tw_re, tw_im, brp, y_re, y_im, ct_re, ct_im,
+        B, N, x_re.stride(0), y_re.stride(0), int(N2), row_offset,
         BLOCK_N=N, LOG2N=LOG2N,
         BAILEY_EPILOGUE=BAILEY_EPILOGUE,
         STRIDED_STORE=STRIDED_STORE,
         num_warps=1, num_stages=1,
     )
-    if not STRIDED_STORE and not BAILEY_EPILOGUE:
-        y_re.copy_(scratch_re)
-        y_im.copy_(scratch_im)
-    elif not STRIDED_STORE:
-        y_re.copy_(scratch_re)
-        y_im.copy_(scratch_im)
-    else:
-        import torch as _t
-        n = _t.arange(scratch_re.shape[1], device=scratch_re.device)
-        out = (n % int(N2)) * (scratch_re.shape[1] // int(N2)) + (n // int(N2))
-        for b in range(B):
-            y_re[b, out] = scratch_re[b]
-            y_im[b, out] = scratch_im[b]
+
 
 
 def f2_launch(x_re, x_im, y_re, y_im, tw_re, tw_im, perm):
