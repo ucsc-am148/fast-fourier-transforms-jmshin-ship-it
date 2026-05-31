@@ -190,54 +190,96 @@ def f2_kernel(
     tl.store(y_im_ptr + pid * stride_yb + n, im, mask=n < N)
 
 
+
+@triton.jit
+def dit_fft_kernel(
+    x_re_ptr, x_im_ptr,
+    tw_re_ptr, tw_im_ptr,
+    brp_ptr,
+    y_re_ptr, y_im_ptr,
+    ct_re_ptr, ct_im_ptr,
+    B, N,
+    stride_xb, stride_yb, N2, row_offset,
+    BLOCK_N: tl.constexpr,
+    LOG2N: tl.constexpr,
+    BAILEY_EPILOGUE: tl.constexpr,
+    STRIDED_STORE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    n = tl.arange(0, BLOCK_N)
+
+    # Bit-reversed load
+    brp = tl.load(brp_ptr + n).to(tl.int32)
+    v_re = tl.load(x_re_ptr + (pid + row_offset) * stride_xb + brp, mask=n < N)
+    v_im = tl.load(x_im_ptr + (pid + row_offset) * stride_xb + brp, mask=n < N)
+
+    # Write initial values to scratchpad
+    tl.store(y_re_ptr + pid * stride_yb + n, v_re, mask=n < N)
+    tl.store(y_im_ptr + pid * stride_yb + n, v_im, mask=n < N)
+
+    for s in range(LOG2N):
+        half = 1 << s
+        partner = n ^ half
+        tw_idx = (n & (half - 1)) * (N >> (s + 1))
+        tw_re = tl.load(tw_re_ptr + tw_idx)
+        tw_im = tl.load(tw_im_ptr + tw_idx)
+
+        # Load self and partner from scratchpad
+        v_re = tl.load(y_re_ptr + pid * stride_yb + n, mask=n < N)
+        v_im = tl.load(y_im_ptr + pid * stride_yb + n, mask=n < N)
+        p_re = tl.load(y_re_ptr + pid * stride_yb + partner, mask=partner < N)
+        p_im = tl.load(y_im_ptr + pid * stride_yb + partner, mask=partner < N)
+
+        is_upper = ((n >> s) & 1) == 0
+        # upper: new = v + tw * partner
+        # lower: new = partner - tw * v  (note: partner here is upper value)
+        tv_v_re = tw_re * v_re - tw_im * v_im   # tw * v (for lower)
+        tv_v_im = tw_re * v_im + tw_im * v_re
+        tv_p_re = tw_re * p_re - tw_im * p_im   # tw * p (for upper)
+        tv_p_im = tw_re * p_im + tw_im * p_re
+
+        new_re = tl.where(is_upper, v_re + tv_p_re, p_re - tv_v_re)
+        new_im = tl.where(is_upper, v_im + tv_p_im, p_im - tv_v_im)
+
+        tl.store(y_re_ptr + pid * stride_yb + n, new_re, mask=n < N)
+        tl.store(y_im_ptr + pid * stride_yb + n, new_im, mask=n < N)
+
+    v_re = tl.load(y_re_ptr + pid * stride_yb + n, mask=n < N)
+    v_im = tl.load(y_im_ptr + pid * stride_yb + n, mask=n < N)
+
+    if BAILEY_EPILOGUE:
+        ct_re = tl.load(ct_re_ptr + pid * N2 + n, mask=n < N, other=1.0)
+        ct_im = tl.load(ct_im_ptr + pid * N2 + n, mask=n < N, other=0.0)
+        tmp_re = v_re * ct_re - v_im * ct_im
+        tmp_im = v_re * ct_im + v_im * ct_re
+        v_re = tmp_re
+        v_im = tmp_im
+
+    if STRIDED_STORE:
+        out_idx = (n % N2) * (N // N2) + (n // N2)
+        tl.store(y_re_ptr + pid * stride_yb + out_idx, v_re, mask=n < N)
+        tl.store(y_im_ptr + pid * stride_yb + out_idx, v_im, mask=n < N)
+    else:
+        tl.store(y_re_ptr + pid * stride_yb + n, v_re, mask=n < N)
+        tl.store(y_im_ptr + pid * stride_yb + n, v_im, mask=n < N)
+
 def _f2_triton(x_re, x_im, tw_re, tw_im, brp, y_re, y_im,
                ct_re=None, ct_im=None, N2=1, row_offset=0,
                BAILEY_EPILOGUE=False, STRIDED_STORE=False):
-    """Stockham FFT: race-free, no scratchpad, no bit-reversal needed."""
+    """Single-kernel DIT FFT using y buffer as scratchpad."""
     B, N = x_re.shape
     LOG2N = int(math.log2(N))
     assert 1 << LOG2N == N
-
-    # Allocate two ping-pong buffers (flat B*N)
-    buf_re = [
-        x_re.reshape(-1).contiguous().clone(),
-        torch.empty(B * N, dtype=x_re.dtype, device=x_re.device),
-    ]
-    buf_im = [
-        x_im.reshape(-1).contiguous().clone(),
-        torch.empty(B * N, dtype=x_im.dtype, device=x_im.device),
-    ]
-
-    cur = 0  # which buffer is current input
-    m = 1
-    for s in range(LOG2N):
-        nxt = 1 - cur
-        stockham_stage_kernel[(B,)](
-            buf_re[cur], buf_im[cur],
-            buf_re[nxt], buf_im[nxt],
-            N, m, BLOCK_N=N,
-        )
-        cur = nxt
-        m *= 2
-
-    # Epilogue: copy result to y, apply Bailey cross-twiddle if needed
     if ct_re is None:
-        ct_re_arg = x_re
-        ct_im_arg = x_im
-    else:
-        ct_re_arg = ct_re
-        ct_im_arg = ct_im
-
-    stockham_epilogue_kernel[(B,)](
-        buf_re[cur].reshape(B, N),
-        buf_im[cur].reshape(B, N),
-        y_re, y_im,
-        ct_re_arg, ct_im_arg,
-        N, int(N2),
-        y_re.stride(0),
-        BLOCK_N=N,
+        ct_re = x_re
+        ct_im = x_im
+    dit_fft_kernel[(B,)](
+        x_re, x_im, tw_re, tw_im, brp, y_re, y_im, ct_re, ct_im,
+        B, N, x_re.stride(0), y_re.stride(0), int(N2), row_offset,
+        BLOCK_N=N, LOG2N=LOG2N,
         BAILEY_EPILOGUE=BAILEY_EPILOGUE,
         STRIDED_STORE=STRIDED_STORE,
+        num_warps=min(N//32, 32), num_stages=1,
     )
 
 
