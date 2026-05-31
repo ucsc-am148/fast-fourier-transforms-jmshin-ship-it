@@ -490,6 +490,20 @@ def bailey_scale_kernel(
         tl.store(y_im_ptr + offs, y_im, mask=mask)
 
 
+
+def _scale_into(x_re, x_im, tw_re, tw_im, m0, M, y_re, y_im):
+    """Scale with pre-allocated output buffers — no allocation."""
+    m0, M = int(m0), int(M)
+    total = x_re.numel()
+    BLOCK = 256
+    grid = (triton.cdiv(total, BLOCK),)
+    bailey_scale_kernel[grid](
+        x_re.reshape(-1), x_im.reshape(-1),
+        tw_re.reshape(-1), tw_im.reshape(-1),
+        y_re.reshape(-1), y_im.reshape(-1),
+        m0, M, STORE_T=False, BLOCK=BLOCK,
+    )
+
 def _scale(x_re, x_im, tw_re, tw_im, m0, M, store_t=False):
     m0, M = int(m0), int(M)
     x_re_flat = x_re.reshape(-1)
@@ -564,22 +578,25 @@ def f5_launch(in_re, in_im, b0_re, b0_im, b1_re, b1_im, b2_re, b2_im, plan, B):
     bt_im = plan['bt_im']
     B = int(B)
 
+    # T1: reuse b1 as output buffer for transpose
     t1_re, t1_im = _transpose(in_re, in_im, B, N2, N1)
-    a_re = t1_re.reshape(B * N1, N2).contiguous()
-    a_im = t1_im.reshape(B * N1, N2).contiguous()
+    # F4-A: write directly into b1 slice
     fa_re = b1_re[:B * N1 * N2].reshape(B * N1, N2)
     fa_im = b1_im[:B * N1 * N2].reshape(B * N1, N2)
-    _run_f4(a_re, a_im, fa_re, fa_im, f4)
-
-    sc_re, sc_im = _scale(fa_re, fa_im, bt_re, bt_im, N1, N2)
-
+    _run_f4(t1_re.reshape(B * N1, N2).contiguous(),
+            t1_im.reshape(B * N1, N2).contiguous(), fa_re, fa_im, f4)
+    # Scale: write into b2 slice (reuse as scratch)
+    sc_re = b2_re[:B * N1 * N2].reshape(B * N1, N2)
+    sc_im = b2_im[:B * N1 * N2].reshape(B * N1, N2)
+    _scale_into(fa_re, fa_im, bt_re, bt_im, N1, N2, sc_re, sc_im)
+    # T2
     t2_re, t2_im = _transpose(sc_re.reshape(B, N), sc_im.reshape(B, N), B, N1, N2)
-    b_re = t2_re.reshape(B * N2, N1).contiguous()
-    b_im = t2_im.reshape(B * N2, N1).contiguous()
-    fb_re = b2_re[:B * N2 * N1].reshape(B * N2, N1)
-    fb_im = b2_im[:B * N2 * N1].reshape(B * N2, N1)
-    _run_f4(b_re, b_im, fb_re, fb_im, f4)
-
+    # F4-B: write into b1 slice
+    fb_re = b1_re[:B * N2 * N1].reshape(B * N2, N1)
+    fb_im = b1_im[:B * N2 * N1].reshape(B * N2, N1)
+    _run_f4(t2_re.reshape(B * N2, N1).contiguous(),
+            t2_im.reshape(B * N2, N1).contiguous(), fb_re, fb_im, f4)
+    # T3: write directly into b0
     t3_re, t3_im = _transpose(fb_re.reshape(B, N), fb_im.reshape(B, N), B, N2, N1)
     b0_re.copy_(t3_re.reshape(B, N))
     b0_im.copy_(t3_im.reshape(B, N))
